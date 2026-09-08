@@ -23,11 +23,11 @@ JAPANESE_MODEL_NAME = "hotchpotch/japanese-reranker-base-v2"
     ],
 )
 def test_encode_plus_inserts_special_tokens(model_name: str, query: str, document: str) -> None:
-    """Ensure encode_plus inserts special tokens for both English and Japanese checkpoints."""
+    """Ensure tokenizer() inserts special tokens for both English and Japanese checkpoints."""
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    encoding = tokenizer.encode_plus(
+    encoding = tokenizer(
         query,
         document,
         add_special_tokens=True,
@@ -70,14 +70,14 @@ def test_encode_plus_inserts_special_tokens(model_name: str, query: str, documen
     )
 
     # Confirm that removing special tokens changes the sequence start.
-    encoding_no_special = tokenizer.encode_plus(
+    encoding_no_special = tokenizer(
         query,
         document,
         add_special_tokens=False,
         return_token_type_ids=True,
     )
-    assert encoding_no_special["input_ids"], "encode_plus without specials returned no tokens."
+    assert encoding_no_special["input_ids"], "tokenizer() without specials returned no tokens."
     assert encoding_no_special["input_ids"][0] not in start_candidates, (
-        "encode_plus(add_special_tokens=False) unexpectedly kept the start special token; "
+        "tokenizer(add_special_tokens=False) unexpectedly kept the start special token; "
         "this would invalidate the special-token check."
     )
