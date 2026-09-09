@@ -1371,7 +1371,7 @@ class OpenProvencePreTrainedModel(PreTrainedModel):
                     "OpenProvenceConfig must define base_model_config or base_model_name_or_path."
                 )
             base_config = AutoConfig.from_pretrained(base_reference, trust_remote_code=True)
-        base_config.num_labels = config.num_labels
+        base_config.num_labels = cast(int, config.num_labels)
         return base_config
 
     def _init_tokenizer(self, config: OpenProvenceConfig):
@@ -1712,7 +1712,7 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
             else:
                 loss_fct = nn.CrossEntropyLoss()
                 loss_tensor = loss_fct(
-                    ranking_logits.view(-1, self.config.num_labels), labels.view(-1)
+                    ranking_logits.view(-1, cast(int, self.config.num_labels)), labels.view(-1)
                 )
 
         loss_output: FloatTensor | None

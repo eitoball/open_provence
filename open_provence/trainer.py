@@ -469,7 +469,7 @@ class OpenProvenceTrainer(Trainer):
         model: torch.nn.Module,
         inputs: dict[str, Any],
         return_outputs: bool = False,
-        num_items_in_batch: torch.Tensor | None = None,
+        num_items_in_batch: torch.Tensor | int | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
         """Compute loss using OpenProvenceLoss."""

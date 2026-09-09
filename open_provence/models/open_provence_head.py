@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -61,7 +60,7 @@ class OpenProvenceHead(PreTrainedModel):
     def __init__(self, config: OpenProvenceHeadConfig):
         super().__init__(config)
 
-        self.num_labels = config.num_labels
+        self.num_labels = cast(int, config.num_labels)
         self.sentence_pooling = config.sentence_pooling
         self.use_weighted_pooling = config.use_weighted_pooling
 
@@ -69,7 +68,7 @@ class OpenProvenceHead(PreTrainedModel):
         self.dropout = nn.Dropout(config.classifier_dropout)
 
         # Classification head
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
 
         # Optional: Weighted pooling layer
         if self.use_weighted_pooling:
@@ -285,27 +284,27 @@ class OpenProvenceHead(PreTrainedModel):
         save_directory: str | os.PathLike[str],
         is_main_process: bool = True,
         state_dict: dict[str, torch.Tensor] | None = None,
-        save_function: Callable[..., Any] | None = None,
         push_to_hub: bool = False,
         max_shard_size: int | str = "5GB",
-        safe_serialization: bool = True,
         variant: str | None = None,
         token: str | bool | None = None,
         save_peft_format: bool = True,
+        save_original_format: bool = True,
+        distributed_checkpoint: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Delegate to the base implementation while defaulting to `torch.save` when needed."""
+        """Delegate to the base implementation (safetensors-only save in transformers v5)."""
         super().save_pretrained(
             save_directory,
             is_main_process=is_main_process,
             state_dict=state_dict,
-            save_function=save_function or torch.save,
             push_to_hub=push_to_hub,
             max_shard_size=max_shard_size,
-            safe_serialization=safe_serialization,
             variant=variant,
             token=token,
             save_peft_format=save_peft_format,
+            save_original_format=save_original_format,
+            distributed_checkpoint=distributed_checkpoint,
             **kwargs,
         )
 
