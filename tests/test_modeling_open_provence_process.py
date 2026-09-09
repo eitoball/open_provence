@@ -160,7 +160,12 @@ def test_prepare_block_inputs_inserts_special_tokens(
 @pytest.mark.parametrize(
     ("checkpoint", "remote_id", "expected_flag"),
     [
-        (ENGLISH_MODEL_PATH, ENGLISH_REMOTE_ID, True),
+        # Under transformers v5, build_inputs_with_special_tokens is gone from the standard
+        # fast-tokenizer backend, so ModernBERT's tokenizer (which never overrode that
+        # generic no-op method) now goes through the post_processor-template fallback --
+        # which places CLS/SEP correctly, so the manual-override heuristic no longer
+        # triggers here (it was True under v4, where the broken native method was used).
+        (ENGLISH_MODEL_PATH, ENGLISH_REMOTE_ID, False),
         (JAPANESE_MODEL_PATH, EN_JP_REMOTE_ID, False),
     ],
 )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -138,6 +139,124 @@ class DoubleSepTokenizer(DummyTokenizer):
         if tokens_b:
             return [0] * (len(tokens_a) + 3) + [1] * (len(tokens_b) + 1)
         return [0] * (len(tokens_a) + 3)
+
+
+class _RustTokenizerStub:
+    """Stand-in for the `tokenizers.Tokenizer` exposed via `PreTrainedTokenizerFast._tokenizer`."""
+
+    def __init__(self, post_processor: dict[str, Any]) -> None:
+        self._payload = json.dumps({"post_processor": post_processor})
+
+    def to_str(self) -> str:
+        return self._payload
+
+
+class TemplateOnlyTokenizer:
+    """Simulates transformers v5's TokenizersBackend for a BERT-family tokenizer.
+
+    Unlike DummyTokenizer/DoubleSepTokenizer, this has no build_inputs_with_special_tokens
+    or create_token_type_ids_from_sequences -- v5's standard fast-tokenizer backend removed
+    both -- so OpenProvenceModel must fall back to parsing `_tokenizer.to_str()`'s
+    post_processor template, matching the shape real ModernBERT checkpoints exposed
+    (verified against `Alibaba-NLP/gte-reranker-modernbert-base` on 2026-09-09).
+    """
+
+    cls_token_id = 50281
+    sep_token_id = 50282
+
+    def __init__(self) -> None:
+        self._tokenizer = _RustTokenizerStub(
+            {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+                ],
+                "pair": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+                    {"Sequence": {"id": "B", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+                ],
+                "special_tokens": {
+                    "[CLS]": {"id": "[CLS]", "ids": [50281], "tokens": ["[CLS]"]},
+                    "[SEP]": {"id": "[SEP]", "ids": [50282], "tokens": ["[SEP]"]},
+                },
+            }
+        )
+
+    def encode(self, text, add_special_tokens: bool = False):
+        return [ord(ch) for ch in text]
+
+
+class DoubleClsTemplateTokenizer:
+    """Simulates v5's backend for a tokenizer whose pair template repeats CLS before B.
+
+    Matches the shape real Llama/sentencepiece-based rerankers expose (verified against
+    `hotchpotch/japanese-reranker-base-v2` on 2026-09-09): `<s> A </s> <s> B </s>` with a
+    type_id split at the second `<s>`.
+    """
+
+    cls_token_id = 1
+    sep_token_id = 2
+
+    def __init__(self) -> None:
+        self._tokenizer = _RustTokenizerStub(
+            {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "</s>", "type_id": 0}},
+                ],
+                "pair": [
+                    {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "</s>", "type_id": 0}},
+                    {"SpecialToken": {"id": "<s>", "type_id": 1}},
+                    {"Sequence": {"id": "B", "type_id": 1}},
+                    {"SpecialToken": {"id": "</s>", "type_id": 1}},
+                ],
+                "special_tokens": {
+                    "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+                    "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]},
+                },
+            }
+        )
+
+    def encode(self, text, add_special_tokens: bool = False):
+        return [ord(ch) for ch in text]
+
+
+class RobertaProcessingTokenizer:
+    """Simulates v5's backend for a RoBERTa-family tokenizer.
+
+    RoBERTa fast tokenizers use a dedicated `RobertaProcessing` post_processor instead of
+    `TemplateProcessing` (verified against `roberta-base` on 2026-09-09): a fixed
+    `<s> A </s></s> B </s>` pair layout with `cls`/`sep` given as `[token, id]` pairs, not
+    a `single`/`pair` step list. Without translating this shape, the fallback silently
+    concatenates query+context with no special tokens at all for every RoBERTa-backed
+    backbone.
+    """
+
+    cls_token_id = 1
+    sep_token_id = 2
+
+    def __init__(self) -> None:
+        self._tokenizer = _RustTokenizerStub(
+            {
+                "type": "RobertaProcessing",
+                "sep": ["</s>", 2],
+                "cls": ["<s>", 1],
+                "trim_offsets": True,
+                "add_prefix_space": False,
+            }
+        )
+
+    def encode(self, text, add_special_tokens: bool = False):
+        return [ord(ch) for ch in text]
 
 
 @pytest.fixture
@@ -845,6 +964,70 @@ def test_prepare_block_inputs_handles_additional_special_tokens():
         query_tokens, context_tokens
     )
     assert token_type_ids == expected_type_ids
+
+
+def test_build_inputs_falls_back_to_post_processor_template_without_native_api():
+    """transformers v5 removed build_inputs_with_special_tokens from the standard fast
+    tokenizer backend; OpenProvenceModel must reconstruct CLS/SEP placement by parsing
+    the tokenizer's post_processor template instead of erroring or dropping specials.
+    """
+    tokenizer = TemplateOnlyTokenizer()
+    model = OpenProvenceModel.__new__(OpenProvenceModel)
+    model.tokenizer = tokenizer
+
+    query_ids = [1, 2, 3]
+    context_ids = [4, 5]
+
+    input_ids = model._build_inputs_with_special_tokens(query_ids, context_ids)
+    type_ids = model._create_token_type_ids_from_sequences(query_ids, context_ids)
+
+    assert input_ids == [50281, 1, 2, 3, 50282, 4, 5, 50282]
+    assert type_ids == [0, 0, 0, 0, 0, 0, 0, 0]
+
+    single_input_ids = model._build_inputs_with_special_tokens(query_ids)
+    assert single_input_ids == [50281, 1, 2, 3, 50282]
+
+
+def test_build_inputs_from_post_processor_template_handles_repeated_special_tokens():
+    """Some pair templates repeat a special token before the second sequence (e.g. Llama/
+    sentencepiece-based rerankers use `<s> A </s> <s> B </s>`); the fallback must follow
+    the template's own type_id assignment rather than assuming a single CLS/trailing SEP.
+    """
+    tokenizer = DoubleClsTemplateTokenizer()
+    model = OpenProvenceModel.__new__(OpenProvenceModel)
+    model.tokenizer = tokenizer
+
+    query_ids = [10, 11]
+    context_ids = [20, 21, 22]
+
+    input_ids = model._build_inputs_with_special_tokens(query_ids, context_ids)
+    type_ids = model._create_token_type_ids_from_sequences(query_ids, context_ids)
+
+    assert input_ids == [1, 10, 11, 2, 1, 20, 21, 22, 2]
+    assert type_ids == [0, 0, 0, 0, 1, 1, 1, 1, 1]
+
+
+def test_build_inputs_from_roberta_processing_uses_double_sep_pair_layout():
+    """RoBERTa-family tokenizers expose a `RobertaProcessing` post_processor, not
+    `TemplateProcessing`. Without translating its `cls`/`sep` fields into the same
+    step shape, the fallback finds no usable template and silently drops all special
+    tokens instead of producing RoBERTa's `<s> A </s></s> B </s>` pair layout.
+    """
+    tokenizer = RobertaProcessingTokenizer()
+    model = OpenProvenceModel.__new__(OpenProvenceModel)
+    model.tokenizer = tokenizer
+
+    query_ids = [10, 11]
+    context_ids = [20, 21, 22]
+
+    input_ids = model._build_inputs_with_special_tokens(query_ids, context_ids)
+    type_ids = model._create_token_type_ids_from_sequences(query_ids, context_ids)
+
+    assert input_ids == [1, 10, 11, 2, 2, 20, 21, 22, 2]
+    assert type_ids == [0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    single_input_ids = model._build_inputs_with_special_tokens(query_ids)
+    assert single_input_ids == [1, 10, 11, 2]
 
 
 def test_english_sentence_splitter_handles_lists_with_nltk():

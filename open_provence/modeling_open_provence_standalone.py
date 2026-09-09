@@ -16,6 +16,7 @@ checkpoints remain portable.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -57,6 +58,8 @@ DEFAULT_SPLITTER_LANGUAGE = "auto"  # Updated during export; keep marker for too
 DEFAULT_PROCESS_THRESHOLD = 0.1  # Default pruning threshold when config does not specify one
 
 _PROGRESS_BAR_ENABLED = True
+
+_TEMPLATE_PROCESSING_UNSET: Any = object()
 
 
 def enable_progress_bar() -> None:
@@ -659,6 +662,77 @@ def _normalize_sentences(
         return sentences
 
     return [_fallback_sentence(context_text, strip_sentences)]
+
+
+def _extract_template_processing(
+    post_processor: Mapping[str, Any] | None,
+) -> tuple[dict[str, list[Mapping[str, Any]]], Mapping[str, Mapping[str, Any]]] | None:
+    """Pull the special-token template out of a tokenizer.json-style post_processor block.
+
+    transformers v5's standard fast-tokenizer backend removed
+    ``build_inputs_with_special_tokens``/``create_token_type_ids_from_sequences``. The
+    only remaining source of truth for special-token placement is the underlying Rust
+    tokenizer's ``post_processor``, serialized with the same schema as
+    ``tokenizer.json``, so this parses that structure instead.
+    """
+
+    if not isinstance(post_processor, Mapping):
+        return None
+
+    processor_type = post_processor.get("type")
+    if processor_type == "TemplateProcessing":
+        single = post_processor.get("single")
+        pair = post_processor.get("pair")
+        special_tokens = post_processor.get("special_tokens")
+        if (
+            isinstance(single, list)
+            and isinstance(pair, list)
+            and isinstance(special_tokens, Mapping)
+        ):
+            return {"single": single, "pair": pair}, special_tokens
+        return None
+
+    if processor_type == "RobertaProcessing":
+        # RoBERTa-family tokenizers (byte-level BPE + this fixed post-processor) use a
+        # dedicated processor instead of TemplateProcessing. Its pair layout is fixed --
+        # <s> A </s></s> B </s>, all type_id 0 -- so translate it into the same
+        # SpecialToken/Sequence step shape TemplateProcessing produces, rather than
+        # teaching every consumer a second format.
+        cls_entry = post_processor.get("cls")
+        sep_entry = post_processor.get("sep")
+        if (
+            isinstance(cls_entry, (list, tuple))
+            and len(cls_entry) == 2
+            and isinstance(sep_entry, (list, tuple))
+            and len(sep_entry) == 2
+        ):
+            cls_token, cls_id = cls_entry
+            sep_token, sep_id = sep_entry
+            special_tokens = {
+                cls_token: {"id": cls_token, "ids": [cls_id], "tokens": [cls_token]},
+                sep_token: {"id": sep_token, "ids": [sep_id], "tokens": [sep_token]},
+            }
+            cls_step = {"SpecialToken": {"id": cls_token, "type_id": 0}}
+            sep_step = {"SpecialToken": {"id": sep_token, "type_id": 0}}
+            single = [cls_step, {"Sequence": {"id": "A", "type_id": 0}}, sep_step]
+            pair = [
+                cls_step,
+                {"Sequence": {"id": "A", "type_id": 0}},
+                sep_step,
+                sep_step,
+                {"Sequence": {"id": "B", "type_id": 0}},
+                sep_step,
+            ]
+            return {"single": single, "pair": pair}, special_tokens
+        return None
+
+    if processor_type == "Sequence":
+        for nested in post_processor.get("processors") or []:
+            extracted = _extract_template_processing(nested)
+            if extracted is not None:
+                return extracted
+
+    return None
 
 
 def _tokenize_sentences(tokenizer: Any, sentences: Sequence[str]) -> list[list[int]]:
@@ -1498,6 +1572,81 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
                 return candidate
         return None
 
+    def _get_post_processor_template(
+        self,
+    ) -> tuple[dict[str, list[Mapping[str, Any]]], Mapping[str, Mapping[str, Any]]] | None:
+        cached = getattr(self, "_post_processor_template", _TEMPLATE_PROCESSING_UNSET)
+        if cached is not _TEMPLATE_PROCESSING_UNSET:
+            return cast(Any, cached)
+
+        template_info = None
+        rust_tokenizer = getattr(self.tokenizer, "_tokenizer", None)
+        to_str = getattr(rust_tokenizer, "to_str", None)
+        if callable(to_str):
+            try:
+                raw = json.loads(to_str())
+                template_info = _extract_template_processing(raw.get("post_processor"))
+            except Exception:  # pragma: no cover - defensive against unexpected tokenizer.json
+                template_info = None
+
+        self._post_processor_template = template_info
+        return template_info
+
+    def _assemble_from_post_processor_template(
+        self, ids_a: Sequence[int], ids_b: Sequence[int] | None
+    ) -> tuple[list[int], list[int] | None]:
+        ids_a_list = [int(token) for token in ids_a]
+        ids_b_list = [int(token) for token in ids_b] if ids_b is not None else None
+
+        template_info = self._get_post_processor_template()
+        if template_info is None:
+            return ids_a_list + (ids_b_list or []), None
+
+        template, special_tokens = template_info
+        steps = template["pair"] if ids_b_list is not None else template["single"]
+
+        ids_out: list[int] = []
+        type_ids_out: list[int] = []
+        for step in steps:
+            special = step.get("SpecialToken")
+            if special is not None:
+                special_ids = special_tokens[special["id"]]["ids"]
+                ids_out.extend(int(token) for token in special_ids)
+                type_ids_out.extend([int(special["type_id"])] * len(special_ids))
+                continue
+            sequence = step.get("Sequence")
+            if sequence is not None:
+                source = ids_a_list if sequence["id"] == "A" else (ids_b_list or [])
+                ids_out.extend(source)
+                type_ids_out.extend([int(sequence["type_id"])] * len(source))
+
+        return ids_out, type_ids_out
+
+    def _build_inputs_with_special_tokens(
+        self, ids_a: Sequence[int], ids_b: Sequence[int] | None = None
+    ) -> list[int]:
+        """Insert special tokens, mirroring the tokenizer API removed in transformers v5.
+
+        Tokenizers that still define ``build_inputs_with_special_tokens`` (test doubles,
+        slow/legacy backends) keep using it unchanged. Standard fast tokenizers under v5
+        no longer have it, so we fall back to the post_processor template instead.
+        """
+
+        native = getattr(self.tokenizer, "build_inputs_with_special_tokens", None)
+        if callable(native):
+            return [int(token) for token in native(ids_a, ids_b)]
+        ids_out, _ = self._assemble_from_post_processor_template(ids_a, ids_b)
+        return ids_out
+
+    def _create_token_type_ids_from_sequences(
+        self, ids_a: Sequence[int], ids_b: Sequence[int] | None = None
+    ) -> list[int] | None:
+        native = getattr(self.tokenizer, "create_token_type_ids_from_sequences", None)
+        if callable(native):
+            return [int(token) for token in native(ids_a, ids_b)]
+        _, type_ids_out = self._assemble_from_post_processor_template(ids_a, ids_b)
+        return type_ids_out
+
     def _requires_manual_special_tokens(self) -> bool:
         """Detect tokenizers (e.g., ModernBERT) that omit special tokens in build_inputs."""
 
@@ -1511,7 +1660,7 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
         if not query_tokens or not context_tokens:
             return False
 
-        built = tokenizer.build_inputs_with_special_tokens(query_tokens, context_tokens)
+        built = self._build_inputs_with_special_tokens(query_tokens, context_tokens)
         built = [int(token) for token in built]
 
         special_map = cast(Mapping[str, Any], getattr(tokenizer, "special_tokens_map", {}))
@@ -2111,9 +2260,7 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
         for fragment in fragments:
             context_tokens.extend(int(token) for token in fragment.token_ids)
 
-        built_with_specials = self.tokenizer.build_inputs_with_special_tokens(
-            query_list, context_tokens
-        )
+        built_with_specials = self._build_inputs_with_special_tokens(query_list, context_tokens)
         built_with_specials = [int(token) for token in built_with_specials]
 
         manual_override = getattr(self, "_manual_special_tokens_required", False)
@@ -2146,7 +2293,7 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
 
         token_type_ids: list[int] | None
         try:
-            token_type_ids = self.tokenizer.create_token_type_ids_from_sequences(
+            token_type_ids = self._create_token_type_ids_from_sequences(
                 query_list,
                 context_tokens,
             )
@@ -2173,7 +2320,7 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
         if context_tokens:
             context_start = _find_subsequence_start(input_ids, context_tokens)
             if context_start < 0:
-                prefix_ids = self.tokenizer.build_inputs_with_special_tokens(query_list, [])
+                prefix_ids = self._build_inputs_with_special_tokens(query_list, [])
                 context_start = len(prefix_ids)
             cursor = context_start
             for fragment in fragments:
