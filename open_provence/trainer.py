@@ -380,8 +380,12 @@ class PruningTrainingArguments(TrainingArguments):
     num_train_epochs: float = field(
         default=1.0, metadata={"help": "Total number of training epochs to perform."}
     )
-    warmup_ratio: float = field(
-        default=0.1, metadata={"help": "Linear warmup over warmup_ratio fraction of total steps."}
+    warmup_steps: float = field(
+        default=0.1,
+        metadata={
+            "help": "Warmup steps for the LR scheduler. A float < 1 is treated as a ratio "
+            "of total steps; an int (or float >= 1) is treated as an absolute step count."
+        },
     )
     optim: str = field(default="adafactor", metadata={"help": "The optimizer to use."})
     bf16: bool = field(
@@ -1345,7 +1349,6 @@ def parse_config_file(
         output_dir=training_config.get(
             "output_dir", None
         ),  # Optional, will be auto-generated if not provided
-        overwrite_output_dir=training_config.get("overwrite_output_dir", True),
         do_train=training_config.get("do_train", True),
         do_eval=training_config.get("do_eval", True),
         num_train_epochs=training_config.get("num_train_epochs", 1),
@@ -1356,7 +1359,7 @@ def parse_config_file(
         weight_decay=training_config.get("weight_decay", 0.01),
         max_grad_norm=training_config.get("max_grad_norm", 1.0),
         lr_scheduler_type=training_config.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=training_config.get("warmup_ratio", 0.1),
+        warmup_steps=training_config.get("warmup_ratio", training_config.get("warmup_steps", 0.1)),
         # Dynamic steps will be set later
         logging_steps=logging_steps or 100,  # Temporary default
         save_steps=save_steps or 500,  # Temporary default
