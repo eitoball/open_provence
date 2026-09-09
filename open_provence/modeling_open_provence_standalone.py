@@ -1420,6 +1420,7 @@ class OpenProvencePreTrainedModel(PreTrainedModel):
         self._manual_sep_token_id: int | None = None
         self._update_tokenizer_runtime()
         self.default_threshold = self._resolve_default_threshold(config)
+        self.post_init()
         self.eval()
 
         if resolved_device is not None:
@@ -1581,10 +1582,10 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
 
         template_info = None
         rust_tokenizer = getattr(self.tokenizer, "_tokenizer", None)
-        to_str = getattr(rust_tokenizer, "to_str", None)
+        to_str = cast(Any, getattr(rust_tokenizer, "to_str", None))
         if callable(to_str):
             try:
-                raw = json.loads(to_str())
+                raw = json.loads(cast(str, to_str()))
                 template_info = _extract_template_processing(raw.get("post_processor"))
             except Exception:  # pragma: no cover - defensive against unexpected tokenizer.json
                 template_info = None
@@ -1632,18 +1633,18 @@ class OpenProvenceModel(OpenProvencePreTrainedModel):
         no longer have it, so we fall back to the post_processor template instead.
         """
 
-        native = getattr(self.tokenizer, "build_inputs_with_special_tokens", None)
+        native = cast(Any, getattr(self.tokenizer, "build_inputs_with_special_tokens", None))
         if callable(native):
-            return [int(token) for token in native(ids_a, ids_b)]
+            return [int(token) for token in cast("Iterable[int]", native(ids_a, ids_b))]
         ids_out, _ = self._assemble_from_post_processor_template(ids_a, ids_b)
         return ids_out
 
     def _create_token_type_ids_from_sequences(
         self, ids_a: Sequence[int], ids_b: Sequence[int] | None = None
     ) -> list[int] | None:
-        native = getattr(self.tokenizer, "create_token_type_ids_from_sequences", None)
+        native = cast(Any, getattr(self.tokenizer, "create_token_type_ids_from_sequences", None))
         if callable(native):
-            return [int(token) for token in native(ids_a, ids_b)]
+            return [int(token) for token in cast("Iterable[int]", native(ids_a, ids_b))]
         _, type_ids_out = self._assemble_from_post_processor_template(ids_a, ids_b)
         return type_ids_out
 

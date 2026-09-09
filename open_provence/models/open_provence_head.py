@@ -75,7 +75,7 @@ class OpenProvenceHead(PreTrainedModel):
             self.pooling_weights = nn.Linear(config.hidden_size, 1)
 
         # Initialize weights
-        self.init_weights()
+        self.post_init()
 
     def forward(
         self,
